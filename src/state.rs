@@ -46,10 +46,8 @@ pub struct State<K = &'static str> {
     spk_jobs: BTreeMap<ElectrumScriptHash, SpkJob>,
     confirmation_job: Option<ConfirmationJob>,
 
-    /// What the jobs have gathered since the last update was handed over.
-    ///
-    /// Both job kinds write here as they progress, and [`poll`](Self::poll) hands it to the caller
-    /// whenever it is not empty.
+    /// Accumulates job results while processing a server message.
+    /// [`Self::handle_incoming`] takes and returns this update if it is nonempty.
     staged: Update<K>,
 
     user_state: RequestTracker,
@@ -107,10 +105,12 @@ impl<K: Ord + Clone> State<K> {
 
     /// Start (or restart) the state machine on a fresh connection.
     ///
-    /// Drops the in-flight confirmation job, resends pending requests and resubscribes to the
-    /// chain and all tracked spks. Call this exactly once per connection, before feeding anything
-    /// to [`poll`](Self::poll) - otherwise nothing is ever sent to the server and the connection
-    /// stays silent. `run_async`/`run_blocking` do it for you.
+    /// Drops the in-flight confirmation job and queues pending requests and subscriptions
+    /// to block headers and all tracked scripts.
+    ///
+    /// Call this once per connection, before passing server messages to
+    /// [`Self::handle_incoming`]. [`run_async`](crate::run_async) and
+    /// [`run_blocking`](crate::run_blocking) call it for you.
     ///
     /// Stashed spk jobs survive: their requests are resent, so they resume where they left off.
     pub fn start(&mut self, req_queue: &mut ReqQueue) {
@@ -147,7 +147,7 @@ impl<K: Ord + Clone> State<K> {
         );
     }
 
-    pub fn poll(
+    pub fn handle_incoming(
         &mut self,
         req_queue: &mut ReqQueue,
         raw: RawIncoming,
