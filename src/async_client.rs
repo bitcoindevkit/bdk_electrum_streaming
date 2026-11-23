@@ -28,15 +28,11 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
 
     /// Queues a batch of Electrum requests without waiting for their responses.
     ///
-    /// Returns `Ok(true)` when the batch is queued.
+    /// Returns `Ok(true)` when the batch is queued, or `Ok(false)` if it is empty.
     ///
     /// # Errors
     ///
     /// Returns an error if the state machine's request channel is closed.
-    ///
-    /// # Panics
-    ///
-    /// Panics if the batch is empty.
     ///
     /// # Callback warning
     ///
@@ -48,7 +44,7 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
                 .client_tx
                 .unbounded_send(ClientAction::Request(batch))
                 .map(|_| true)?),
-            None => todo!(),
+            None => Ok(false),
         }
     }
 
