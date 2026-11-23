@@ -13,16 +13,16 @@ use bdk_core::{
 };
 use bdk_electrum_streaming::{
     electrum_streaming_client::{
-        response, ElectrumScriptHash, ElectrumScriptStatus, RawNotificationOrResponse, RawRequest,
+        response, ElectrumScriptHash, ElectrumScriptStatus, RawIncoming, RawRequest,
     },
-    BlockingState, Cache, DerivedSpkTracker, ReqCoord, ReqQueue, Update,
+    Cache, DerivedSpkTracker, ReqCoord, ReqQueue, State, Update,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::json;
 
 const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
 
-fn raw_msg(v: serde_json::Value) -> RawNotificationOrResponse {
+fn raw_msg(v: serde_json::Value) -> RawIncoming {
     serde_json::from_value(v).expect("must deserialize raw message")
 }
 
@@ -136,7 +136,7 @@ impl Server {
 }
 
 fn drain_requests(
-    state: &mut BlockingState,
+    state: &mut State,
     queue: &mut ReqQueue,
     server: &Server,
 ) -> Vec<Update<&'static str>> {
@@ -159,7 +159,7 @@ fn drain_requests(
 /// the order they were asked for: romanz/electrs happens to answer in order, Fulcrum processes
 /// requests concurrently. Nothing may depend on the ordering.
 fn drain_requests_proofs_first(
-    state: &mut BlockingState,
+    state: &mut State,
     queue: &mut ReqQueue,
     server: &Server,
 ) -> Vec<Update<&'static str>> {
@@ -181,7 +181,7 @@ fn drain_requests_proofs_first(
 }
 
 /// The server's answer to `req`, as a raw JSON-RPC result or error message.
-fn response(req: &RawRequest, server: &Server) -> RawNotificationOrResponse {
+fn response(req: &RawRequest, server: &Server) -> RawIncoming {
     raw_msg(match server.answer(req) {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": req.id, "result": result }),
         Err(message) => json!({
@@ -262,7 +262,7 @@ fn new_state(
     cache: Cache,
     descriptor: Descriptor<DescriptorPublicKey>,
     genesis: block::Header,
-) -> BlockingState {
+) -> State {
     new_state_with_cp(
         cache,
         descriptor,
@@ -277,10 +277,10 @@ fn new_state_with_cp(
     cache: Cache,
     descriptor: Descriptor<DescriptorPublicKey>,
     cp: CheckPoint,
-) -> BlockingState {
+) -> State {
     let mut spk_tracker = DerivedSpkTracker::new(0);
     spk_tracker.insert_descriptor("external", descriptor, 0, []);
-    BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
+    State::new(ReqCoord::default(), cache, spk_tracker, cp)
 }
 
 /// A [`new_state`] whose tracked script has expected txids.
@@ -288,10 +288,10 @@ fn new_state_expecting(
     descriptor: Descriptor<DescriptorPublicKey>,
     genesis: block::Header,
     expected: impl IntoIterator<Item = (ScriptBuf, Txid)>,
-) -> BlockingState {
+) -> State {
     let mut spk_tracker = DerivedSpkTracker::new(0);
     spk_tracker.insert_descriptor("external", descriptor, 0, expected);
-    BlockingState::new(
+    State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -408,7 +408,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     let spk_hash = ElectrumScriptHash::new(descriptor.at_derivation_index(0)?.script_pubkey());
 
     let genesis = constants::genesis_block(Network::Regtest).header;
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         DerivedSpkTracker::new(0),
@@ -452,7 +452,7 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
     spk_tracker.insert_descriptor("external", descriptor, 0, []);
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -510,7 +510,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
     spk_tracker.insert_descriptor("external", descriptor, 0, []);
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,

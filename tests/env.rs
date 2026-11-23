@@ -11,8 +11,8 @@ use bdk_core::{
     ConfirmationBlockTime,
 };
 use bdk_electrum_streaming::{
-    run_async, run_blocking, AsyncClient, AsyncState, BlockingClient, BlockingState, Cache,
-    DerivedSpkTracker, ReqCoord, Update,
+    run_async, run_blocking, AsyncClient, BlockingClient, Cache, DerivedSpkTracker, ReqCoord,
+    State, Update,
 };
 use bdk_testenv::{
     bitcoincore_rpc::{json::CreateRawTransactionInput, RpcApi},
@@ -92,7 +92,7 @@ fn blocking_env() -> anyhow::Result<()> {
     spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
     spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -178,7 +178,7 @@ async fn env() -> anyhow::Result<()> {
     spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
     spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
-    let mut state = AsyncState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -276,7 +276,7 @@ async fn new_block_confirmation_is_anchored_live() -> anyhow::Result<()> {
     spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
     spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
-    let mut state = AsyncState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -437,7 +437,7 @@ impl LiveWallet {
         spk_tracker.insert_descriptor(EXTERNAL, external, 0, []);
         spk_tracker.insert_descriptor(INTERNAL, internal, 0, []);
 
-        let mut state = AsyncState::new(
+        let mut state = State::new(
             ReqCoord::default(),
             Cache::default(),
             spk_tracker,
@@ -767,7 +767,7 @@ fn spawn_session(
         expected_spk_txids(chain, graph, INTERNAL),
     );
 
-    let mut state = AsyncState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,

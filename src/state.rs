@@ -6,9 +6,8 @@ use bdk_core::{
     CheckPoint, ConfirmationBlockTime,
 };
 use electrum_streaming_client::{
-    notification::Notification, request, AsyncPendingRequest, BlockingPendingRequest,
-    ElectrumScriptHash, ElectrumScriptStatus, MaybeBatch, PendingRequest,
-    RawNotificationOrResponse, Request,
+    notification::Notification, request, ElectrumScriptHash, ElectrumScriptStatus, PendingRequest,
+    RawIncoming, RawOneOrMany, Request, RequestTracker,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::from_value;
@@ -37,11 +36,8 @@ impl JobId {
     }
 }
 
-pub type AsyncState<K = &'static str> = State<AsyncPendingRequest, K>;
-pub type BlockingState<K = &'static str> = State<BlockingPendingRequest, K>;
-
 #[derive(Debug)]
-pub struct State<PReq: PendingRequest, K = &'static str> {
+pub struct State<K = &'static str> {
     spk_tracker: DerivedSpkTracker<K>,
     coord: ReqCoord,
     cp: CheckPoint,
@@ -56,10 +52,10 @@ pub struct State<PReq: PendingRequest, K = &'static str> {
     /// whenever it is not empty.
     staged: Update<K>,
 
-    user_state: electrum_streaming_client::State<PReq>,
+    user_state: RequestTracker,
 }
 
-impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
+impl<K: Ord + Clone> State<K> {
     pub fn new(
         coord: ReqCoord,
         cache: Cache,
@@ -74,7 +70,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
             spk_jobs: BTreeMap::new(),
             confirmation_job: None,
             staged: Update::default(),
-            user_state: electrum_streaming_client::State::new(),
+            user_state: RequestTracker::new(),
         }
     }
 
@@ -142,7 +138,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
 
     pub fn user_request<R>(&mut self, req_queue: &mut ReqQueue, req: R)
     where
-        R: Into<MaybeBatch<PReq>>,
+        R: Into<RawOneOrMany<PendingRequest>>,
     {
         req_queue.extend(
             self.user_state
@@ -154,7 +150,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     pub fn poll(
         &mut self,
         req_queue: &mut ReqQueue,
-        raw: RawNotificationOrResponse,
+        raw: RawIncoming,
     ) -> anyhow::Result<Option<Update<K>>> {
         self.handle(req_queue, raw)?;
 
@@ -175,19 +171,15 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
     }
 
     /// Apply one message from the server, driving whatever jobs it touches.
-    fn handle(
-        &mut self,
-        req_queue: &mut ReqQueue,
-        raw: RawNotificationOrResponse,
-    ) -> anyhow::Result<()> {
-        if let Err(e) = self.user_state.process_incoming(raw.clone()) {
+    fn handle(&mut self, req_queue: &mut ReqQueue, raw: RawIncoming) -> anyhow::Result<()> {
+        if let Err(e) = self.user_state.handle_incoming(raw.clone()) {
             match e {
                 electrum_streaming_client::ProcessError::MissingRequest(_) => {}
                 other_err => return Err(other_err.into()),
             }
         }
         match raw {
-            RawNotificationOrResponse::Notification(raw_notification) => {
+            RawIncoming::Notification(raw_notification) => {
                 let notification = Notification::new(&raw_notification)
                     .context("Failed to deserialize notification from server")?;
                 match notification {
@@ -198,7 +190,7 @@ impl<PReq: PendingRequest, K: Ord + Clone> State<PReq, K> {
                     Notification::Unknown(_) => Ok(()),
                 }
             }
-            RawNotificationOrResponse::Response(raw_response) => {
+            RawIncoming::Response(raw_response) => {
                 let PoppedRequest {
                     request: orig_req,
                     job_ids,
