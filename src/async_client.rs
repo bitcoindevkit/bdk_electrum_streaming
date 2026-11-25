@@ -2,22 +2,19 @@
 
 use anyhow::Context;
 use bdk_core::bitcoin::{ScriptBuf, Txid};
-use electrum_streaming_client::{
-    AsyncBatchRequest, AsyncPendingRequest, AsyncPendingRequestTuple, RawNotificationOrResponse,
-    RawRequest,
-};
+use electrum_streaming_client::{BatchRequest, RawIncoming, RawRequest, RequestExt};
 use futures::{channel::mpsc, SinkExt, StreamExt};
 use futures::{pin_mut, select, FutureExt, TryFutureExt};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-use crate::{AsyncClientAction, AsyncState, ReqQueue, Update};
+use crate::{ClientAction, ReqQueue, State, Update};
 
 #[derive(Debug, Clone)]
 pub struct AsyncClient<K> {
-    client_tx: mpsc::UnboundedSender<AsyncClientAction<K>>,
+    client_tx: mpsc::UnboundedSender<ClientAction<K>>,
 }
 
-pub type AsyncReceiver<K> = mpsc::UnboundedReceiver<AsyncClientAction<K>>;
+pub type AsyncReceiver<K> = mpsc::UnboundedReceiver<ClientAction<K>>;
 
 impl<K: Sync + Send + 'static> AsyncClient<K> {
     pub fn new() -> (AsyncClient<K>, AsyncReceiver<K>) {
@@ -25,30 +22,43 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
         (Self { client_tx }, client_rx)
     }
 
-    pub fn from_sender(client_tx: mpsc::UnboundedSender<AsyncClientAction<K>>) -> AsyncClient<K> {
+    pub fn from_sender(client_tx: mpsc::UnboundedSender<ClientAction<K>>) -> AsyncClient<K> {
         Self { client_tx }
     }
 
-    pub fn send_batch_request(&self, batch_req: AsyncBatchRequest) -> anyhow::Result<bool> {
+    /// Queues a batch of Electrum requests without waiting for their responses.
+    ///
+    /// Returns `Ok(true)` when the batch is queued, or `Ok(false)` if it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state machine's request channel is closed.
+    ///
+    /// # Callback warning
+    ///
+    /// [`BatchRequest::request`] callbacks run inline. Waiting for a reply from the
+    /// same client (e.g., via [`Self::send_request`]) inside a callback will deadlock.
+    pub fn send_batch_request(&self, batch_req: BatchRequest) -> anyhow::Result<bool> {
         match batch_req.into_inner() {
             Some(batch) => Ok(self
                 .client_tx
-                .unbounded_send(AsyncClientAction::Request(batch))
+                .unbounded_send(ClientAction::Request(batch))
                 .map(|_| true)?),
-            None => todo!(),
+            None => Ok(false),
         }
     }
 
     pub async fn send_request<Req>(&self, req: Req) -> anyhow::Result<Req::Response>
     where
-        Req: electrum_streaming_client::Request,
-        AsyncPendingRequestTuple<Req, Req::Response>: Into<AsyncPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
     {
-        let mut batch = AsyncBatchRequest::new();
-        let resp_rx = batch.request(req);
+        let mut batch = BatchRequest::new();
+        let resp_rx = batch.request_async(req);
         self.send_batch_request(batch)
             .context("failed to send request to state machine")?;
-        Ok(resp_rx.await?)
+        Ok(resp_rx
+            .await
+            .map_err(|_| anyhow::anyhow!("request got cancelled by the state machine"))??)
     }
 
     /// Track `descriptor` under `keychain` through `next_index` plus lookahead.
@@ -66,18 +76,16 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
     where
         D: Into<Box<Descriptor<DescriptorPublicKey>>>,
     {
-        Ok(self
-            .client_tx
-            .unbounded_send(AsyncClientAction::AddDescriptor {
-                keychain,
-                descriptor: descriptor.into(),
-                next_index,
-                expected_spk_txids: expected_spk_txids.into_iter().collect(),
-            })?)
+        Ok(self.client_tx.unbounded_send(ClientAction::AddDescriptor {
+            keychain,
+            descriptor: descriptor.into(),
+            next_index,
+            expected_spk_txids: expected_spk_txids.into_iter().collect(),
+        })?)
     }
 
     pub async fn stop(&self) -> anyhow::Result<()> {
-        Ok(self.client_tx.unbounded_send(AsyncClientAction::Stop)?)
+        Ok(self.client_tx.unbounded_send(ClientAction::Stop)?)
     }
 }
 
@@ -90,7 +98,7 @@ impl<K: Sync + Send + 'static> AsyncClient<K> {
 /// * `client_rx` is the receiving end of the client channel. The sending end can be transformed
 ///   into a [`AsyncClient`] for requests.
 pub async fn run_async<K, R, W>(
-    state: &mut AsyncState<K>,
+    state: &mut State<K>,
     update_tx: &mut mpsc::UnboundedSender<Update<K>>,
     client_rx: &mut AsyncReceiver<K>,
     read: R,
@@ -106,7 +114,7 @@ where
 }
 
 async fn _run_async<K, R, W>(
-    state: &mut AsyncState<K>,
+    state: &mut State<K>,
     update_tx: &mut mpsc::UnboundedSender<Update<K>>,
     client_rx: &mut AsyncReceiver<K>,
     read: R,
@@ -138,14 +146,14 @@ where
                         None => break,
                     };
                     match &raw {
-                        RawNotificationOrResponse::Notification(raw_notification) => {
+                        RawIncoming::Notification(raw_notification) => {
                             tracing::trace!(
                                 method = &*raw_notification.method,
                                 params = raw_notification.params.to_string(),
                                 "Read raw notification",
                             );
                         },
-                        RawNotificationOrResponse::Response(raw_response) => {
+                        RawIncoming::Response(raw_response) => {
                             tracing::trace!(
                                 id = raw_response.id,
                                 is_ok = raw_response.result.is_ok(),
@@ -153,7 +161,7 @@ where
                             );
                         },
                     };
-                    if let Some(update) = state.poll(&mut req_queue, raw)? {
+                    if let Some(update) = state.handle_incoming(&mut req_queue, raw)? {
                         update_tx.unbounded_send(update).map_err(|err| anyhow::anyhow!(err.to_string()))?;
                     }
                 }

@@ -4,7 +4,7 @@ version = "0.8.0"
 description = "An async/blocking Electrum client for BDK, built as an explicit streaming state machine."
 license = "MIT OR Apache-2.0"
 edition = "2021"
-rust-version = "1.70"
+rust-version = "1.85.0"
 repository = "https://github.com/bitcoindevkit/bdk_electrum_streaming"
 documentation = "https://docs.rs/bdk_electrum_streaming"
 readme = "README.md"
@@ -15,7 +15,7 @@ futures-timer = "3"
 anyhow = "1"
 bdk_core = { version = "0.6", features = ["serde"] }
 miniscript = { version = "12.0.0" }
-electrum_streaming_client = { version = "0.4" }
+electrum_streaming_client = { git = "https://github.com/bitcoindevkit/electrum_streaming_client", rev = "e3bc62f" }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 tracing = "0.1"

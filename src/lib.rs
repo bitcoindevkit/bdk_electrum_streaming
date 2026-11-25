@@ -12,9 +12,7 @@ use bdk_core::ConfirmationBlockTime;
 mod cache;
 pub use cache::*;
 mod state;
-use electrum_streaming_client::{
-    AsyncPendingRequest, BlockingPendingRequest, MaybeBatch, PendingRequest,
-};
+use electrum_streaming_client::{PendingRequest, RawOneOrMany};
 use miniscript::{Descriptor, DescriptorPublicKey};
 pub use state::*;
 mod req;
@@ -33,11 +31,8 @@ pub use confirmation_job::*;
 pub type Update<K> = FullScanResponse<K, ConfirmationBlockTime>;
 pub type AnchorUpdate = BTreeSet<(ConfirmationBlockTime, Txid)>;
 
-pub type BlockingClientAction<K> = ClientAction<K, Box<BlockingPendingRequest>>;
-pub type AsyncClientAction<K> = ClientAction<K, AsyncPendingRequest>;
-
-pub enum ClientAction<K, PReq: PendingRequest> {
-    Request(MaybeBatch<PReq>),
+pub enum ClientAction<K> {
+    Request(RawOneOrMany<PendingRequest>),
     AddDescriptor {
         keychain: K,
         descriptor: Box<Descriptor<DescriptorPublicKey>>,

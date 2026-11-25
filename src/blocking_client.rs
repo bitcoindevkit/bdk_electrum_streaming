@@ -8,32 +8,41 @@ use std::{
 
 use anyhow::Context;
 use bdk_core::bitcoin::{ScriptBuf, Txid};
-use electrum_streaming_client::{
-    BlockingBatchRequest, BlockingPendingRequest, BlockingPendingRequestTuple,
-    RawNotificationOrResponse, RawRequest,
-};
+use electrum_streaming_client::{BatchRequest, RawIncoming, RawRequest, RequestExt};
 use miniscript::{Descriptor, DescriptorPublicKey};
 
-use crate::{BlockingClientAction, BlockingState, ReqQueue, Update};
+use crate::{ClientAction, ReqQueue, State, Update};
 
 #[derive(Debug)]
 pub struct BlockingClient<K> {
-    client_tx: mpsc::Sender<BlockingClientAction<K>>,
+    client_tx: mpsc::Sender<ClientAction<K>>,
 }
 
-pub type BlockingReceiver<K> = mpsc::Receiver<BlockingClientAction<K>>;
+pub type BlockingReceiver<K> = mpsc::Receiver<ClientAction<K>>;
 
 impl<K: Sync + Send + 'static> BlockingClient<K> {
     pub fn new() -> (BlockingClient<K>, BlockingReceiver<K>) {
-        let (client_tx, client_rx) = mpsc::channel::<BlockingClientAction<K>>();
+        let (client_tx, client_rx) = mpsc::channel::<ClientAction<K>>();
         (Self { client_tx }, client_rx)
     }
 
-    pub fn send_batch_request(&self, batch_req: BlockingBatchRequest) -> anyhow::Result<bool> {
+    /// Queues a batch of Electrum requests without waiting for their responses.
+    ///
+    /// Returns `Ok(true)` when the batch is queued, or `Ok(false)` if it is empty.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the state machine's request channel is closed.
+    ///
+    /// # Callback warning
+    ///
+    /// [`BatchRequest::request`] callbacks run inline. Waiting for a reply from the
+    /// same client (e.g., via [`Self::send_request`]) inside a callback will deadlock.
+    pub fn send_batch_request(&self, batch_req: BatchRequest) -> anyhow::Result<bool> {
         match batch_req.into_inner() {
             Some(batch) => Ok(self
                 .client_tx
-                .send(BlockingClientAction::Request(batch.map_into()))
+                .send(ClientAction::Request(batch))
                 .map(|_| true)?),
             None => Ok(false),
         }
@@ -41,11 +50,10 @@ impl<K: Sync + Send + 'static> BlockingClient<K> {
 
     pub fn send_request<Req>(&self, req: Req) -> anyhow::Result<Req::Response>
     where
-        Req: electrum_streaming_client::Request,
-        BlockingPendingRequestTuple<Req, Req::Response>: Into<BlockingPendingRequest>,
+        Req: RequestExt + Send + Sync + 'static,
     {
-        let mut batch = BlockingBatchRequest::new();
-        let resp_rx = batch.request(req);
+        let mut batch = BatchRequest::new();
+        let resp_rx = batch.request_blocking(req);
         self.send_batch_request(batch)
             .context("failed to send request to state machine")?;
         Ok(resp_rx
@@ -66,7 +74,7 @@ impl<K: Sync + Send + 'static> BlockingClient<K> {
         expected_spk_txids: impl IntoIterator<Item = (ScriptBuf, Txid)>,
     ) -> anyhow::Result<()> {
         let descriptor = Box::new(descriptor);
-        Ok(self.client_tx.send(BlockingClientAction::AddDescriptor {
+        Ok(self.client_tx.send(ClientAction::AddDescriptor {
             keychain,
             descriptor,
             next_index,
@@ -75,17 +83,17 @@ impl<K: Sync + Send + 'static> BlockingClient<K> {
     }
 
     pub fn stop(self) -> anyhow::Result<()> {
-        Ok(self.client_tx.send(BlockingClientAction::Stop)?)
+        Ok(self.client_tx.send(ClientAction::Stop)?)
     }
 }
 
 enum StateAction<K> {
-    FromServer(RawNotificationOrResponse),
-    FromClient(BlockingClientAction<K>),
+    FromServer(RawIncoming),
+    FromClient(ClientAction<K>),
 }
 
 pub fn run_blocking<'env, K, R, W>(
-    state: &'env mut BlockingState<K>,
+    state: &'env mut State<K>,
     shutdown: &'env AtomicBool,
     update_tx: &'env mut mpsc::Sender<Update<K>>,
     client_rx: &'env mut BlockingReceiver<K>,
@@ -142,14 +150,14 @@ where
 
                 // Purely for logging.
                 match &raw {
-                    RawNotificationOrResponse::Notification(raw_notification) => {
+                    RawIncoming::Notification(raw_notification) => {
                         tracing::trace!(
                             method = &*raw_notification.method,
                             params = raw_notification.params.to_string(),
                             "read_thread: got notification",
                         );
                     }
-                    RawNotificationOrResponse::Response(raw_response) => {
+                    RawIncoming::Response(raw_response) => {
                         tracing::trace!(
                             id = raw_response.id,
                             is_ok = raw_response.result.is_ok(),
@@ -207,17 +215,17 @@ where
                 };
                 match action {
                     StateAction::FromServer(raw) => {
-                        if let Some(update) = state.poll(&mut req_queue, raw)? {
+                        if let Some(update) = state.handle_incoming(&mut req_queue, raw)? {
                             update_tx
                                 .send(update)
                                 .map_err(|err| anyhow::anyhow!(err.to_string()))
                                 .context("Failed to send to update channel")?;
                         }
                     }
-                    StateAction::FromClient(BlockingClientAction::Request(maybe_batch)) => {
-                        state.user_request(&mut req_queue, maybe_batch.map(|br| *br));
+                    StateAction::FromClient(ClientAction::Request(batch)) => {
+                        state.user_request(&mut req_queue, batch);
                     }
-                    StateAction::FromClient(BlockingClientAction::AddDescriptor {
+                    StateAction::FromClient(ClientAction::AddDescriptor {
                         keychain,
                         descriptor,
                         next_index,
@@ -231,7 +239,7 @@ where
                             expected_spk_txids,
                         );
                     }
-                    StateAction::FromClient(BlockingClientAction::Stop) => {
+                    StateAction::FromClient(ClientAction::Stop) => {
                         drop(write_tx);
                         drop(state_rx);
                         break;

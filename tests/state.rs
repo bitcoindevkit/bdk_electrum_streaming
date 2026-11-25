@@ -13,16 +13,16 @@ use bdk_core::{
 };
 use bdk_electrum_streaming::{
     electrum_streaming_client::{
-        response, ElectrumScriptHash, ElectrumScriptStatus, RawNotificationOrResponse, RawRequest,
+        response, ElectrumScriptHash, ElectrumScriptStatus, RawIncoming, RawRequest,
     },
-    BlockingState, Cache, DerivedSpkTracker, ReqCoord, ReqQueue, Update,
+    Cache, DerivedSpkTracker, ReqCoord, ReqQueue, State, Update,
 };
 use miniscript::{Descriptor, DescriptorPublicKey};
 use serde_json::json;
 
 const XPUB: &str = "xpub661MyMwAqRbcFtXgS5sYJABqqG9YLmC4Q1Rdap9gSE8NqtwybGhePY2gZ29ESFjqJoCu1Rupje8YtGqsefD265TMg7usUDFdp6W1EGMcet8";
 
-fn raw_msg(v: serde_json::Value) -> RawNotificationOrResponse {
+fn raw_msg(v: serde_json::Value) -> RawIncoming {
     serde_json::from_value(v).expect("must deserialize raw message")
 }
 
@@ -136,15 +136,15 @@ impl Server {
 }
 
 fn drain_requests(
-    state: &mut BlockingState,
+    state: &mut State,
     queue: &mut ReqQueue,
     server: &Server,
 ) -> Vec<Update<&'static str>> {
     let mut updates = Vec::new();
     while let Some(req) = queue.pop_front() {
         if let Some(update) = state
-            .poll(queue, response(&req, server))
-            .expect("must poll")
+            .handle_incoming(queue, response(&req, server))
+            .expect("must handle incoming")
         {
             updates.push(update);
         }
@@ -159,7 +159,7 @@ fn drain_requests(
 /// the order they were asked for: romanz/electrs happens to answer in order, Fulcrum processes
 /// requests concurrently. Nothing may depend on the ordering.
 fn drain_requests_proofs_first(
-    state: &mut BlockingState,
+    state: &mut State,
     queue: &mut ReqQueue,
     server: &Server,
 ) -> Vec<Update<&'static str>> {
@@ -170,8 +170,8 @@ fn drain_requests_proofs_first(
             .partition(|req| req.method.as_ref() == "blockchain.transaction.get_merkle");
         for req in proofs.into_iter().chain(rest) {
             if let Some(update) = state
-                .poll(queue, response(&req, server))
-                .expect("must poll")
+                .handle_incoming(queue, response(&req, server))
+                .expect("must handle incoming")
             {
                 updates.push(update);
             }
@@ -181,7 +181,7 @@ fn drain_requests_proofs_first(
 }
 
 /// The server's answer to `req`, as a raw JSON-RPC result or error message.
-fn response(req: &RawRequest, server: &Server) -> RawNotificationOrResponse {
+fn response(req: &RawRequest, server: &Server) -> RawIncoming {
     raw_msg(match server.answer(req) {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": req.id, "result": result }),
         Err(message) => json!({
@@ -262,7 +262,7 @@ fn new_state(
     cache: Cache,
     descriptor: Descriptor<DescriptorPublicKey>,
     genesis: block::Header,
-) -> BlockingState {
+) -> State {
     new_state_with_cp(
         cache,
         descriptor,
@@ -277,10 +277,10 @@ fn new_state_with_cp(
     cache: Cache,
     descriptor: Descriptor<DescriptorPublicKey>,
     cp: CheckPoint,
-) -> BlockingState {
+) -> State {
     let mut spk_tracker = DerivedSpkTracker::new(0);
     spk_tracker.insert_descriptor("external", descriptor, 0, []);
-    BlockingState::new(ReqCoord::default(), cache, spk_tracker, cp)
+    State::new(ReqCoord::default(), cache, spk_tracker, cp)
 }
 
 /// A [`new_state`] whose tracked script has expected txids.
@@ -288,10 +288,10 @@ fn new_state_expecting(
     descriptor: Descriptor<DescriptorPublicKey>,
     genesis: block::Header,
     expected: impl IntoIterator<Item = (ScriptBuf, Txid)>,
-) -> BlockingState {
+) -> State {
     let mut spk_tracker = DerivedSpkTracker::new(0);
     spk_tracker.insert_descriptor("external", descriptor, 0, expected);
-    BlockingState::new(
+    State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -369,7 +369,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
             height: absolute::Height::from_consensus(2)?,
         })])
         .expect("history is not empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -377,7 +377,7 @@ fn anchor_above_local_tip_is_deferred_until_tip_catches_up() -> anyhow::Result<(
             "params": [spk_hash.to_string(), status.to_string()],
         })),
     )?;
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -408,7 +408,7 @@ fn descriptor_inserted_mid_connection_is_subscribed() -> anyhow::Result<()> {
     let spk_hash = ElectrumScriptHash::new(descriptor.at_derivation_index(0)?.script_pubkey());
 
     let genesis = constants::genesis_block(Network::Regtest).header;
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         DerivedSpkTracker::new(0),
@@ -452,7 +452,7 @@ fn last_active_index_is_index_of_active_spk() -> anyhow::Result<()> {
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
     spk_tracker.insert_descriptor("external", descriptor, 0, []);
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -510,7 +510,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
 
     let mut spk_tracker = DerivedSpkTracker::new(LOOKAHEAD);
     spk_tracker.insert_descriptor("external", descriptor, 0, []);
-    let mut state = BlockingState::new(
+    let mut state = State::new(
         ReqCoord::default(),
         Cache::default(),
         spk_tracker,
@@ -541,7 +541,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
 
     // The higher derivation index is notified first.
     let mut updates = Vec::new();
-    updates.extend(state.poll(
+    updates.extend(state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -549,7 +549,7 @@ fn last_active_index_is_highest_regardless_of_notification_order() -> anyhow::Re
             "params": [spk_hash_4.to_string(), status_4.to_string()],
         })),
     )?);
-    updates.extend(state.poll(
+    updates.extend(state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -615,7 +615,7 @@ fn anchor_is_refetched_when_tx_moves_to_another_block_of_same_height() -> anyhow
     // Reorg. Only a header notification is sent: the script status is unchanged, so a server
     // has no reason to notify the script hash.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -679,7 +679,7 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
             in_flight.push(req);
             continue;
         }
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     let stale_req = match in_flight.as_slice() {
         [req] => req.clone(),
@@ -693,7 +693,7 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     // The reorg lands before the server answers.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
     server.merkle_proof = (proof_2b.merkle.clone(), proof_2b.pos);
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -705,7 +705,7 @@ fn merkle_proof_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
 
     // The held answer proves inclusion in the block which was evicted, not in the one which
     // replaced it.
-    updates.extend(state.poll(&mut queue, stale_resp)?);
+    updates.extend(state.handle_incoming(&mut queue, stale_resp)?);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     let anchors = updates
@@ -756,7 +756,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
             in_flight.push(req);
             continue;
         }
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     let held_req = match in_flight.as_slice() {
         [req] => req.clone(),
@@ -765,7 +765,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
     let held_resp = response(&held_req, &server);
 
     server.headers = vec![genesis, header_1, header_2b, header_3b, header_4b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -774,7 +774,7 @@ fn anchors_staged_before_a_reorg_are_not_emitted_after_it() -> anyhow::Result<()
         })),
     )?;
     let mut updates = drain_requests(&mut state, &mut queue, &server);
-    updates.extend(state.poll(&mut queue, held_resp)?);
+    updates.extend(state.handle_incoming(&mut queue, held_resp)?);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     let anchors = updates
@@ -838,7 +838,7 @@ fn a_tx_unconfirmed_by_a_reorg_does_not_error_the_connection() -> anyhow::Result
     // The reorg leaves the tx in the mempool, so the server no longer has it in any block.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
     server.txs = Vec::new();
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -849,7 +849,7 @@ fn a_tx_unconfirmed_by_a_reorg_does_not_error_the_connection() -> anyhow::Result
 
     while let Some(req) = queue.pop_front() {
         state
-            .poll(&mut queue, response(&req, &server))
+            .handle_incoming(&mut queue, response(&req, &server))
             .map_err(|e| anyhow::anyhow!("{e:#}"))?;
     }
     Ok(())
@@ -887,7 +887,7 @@ fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
             in_flight.push(req);
             continue;
         }
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     let stale_req = match in_flight.as_slice() {
         [req] => req.clone(),
@@ -899,7 +899,7 @@ fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
 
     // The reorg lands before the server answers.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -912,7 +912,7 @@ fn merkle_error_predating_a_reorg_is_not_taken_as_a_failed_anchor() -> anyhow::R
     // The held request was received while the tx was out of its block, so it is answered with
     // an error — the wording is the one romanz/electrs really sends, a bare JSON string which
     // conflates a genuine fault with the everyday reorg.
-    updates.extend(state.poll(
+    updates.extend(state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -973,7 +973,7 @@ fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
         } else {
             response(&req, &server)
         };
-        state.poll(&mut queue, resp)?;
+        state.handle_incoming(&mut queue, resp)?;
     }
     assert_eq!(
         merkle_requests, 1,
@@ -987,7 +987,7 @@ fn a_merkle_error_is_not_recorded_as_a_failed_anchor() -> anyhow::Result<()> {
     // The reorg replaces the block, so the anchor is asked for again — which it could not be
     // had the error dropped this script from `spk_hashes_by_height`.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1041,7 +1041,7 @@ fn anchor_is_refetched_after_a_same_height_reorg() -> anyhow::Result<()> {
 
     // The tip does not move: same height, different block, unchanged script status.
     server.headers = vec![genesis, header_1, header_2b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1095,7 +1095,7 @@ fn anchor_is_refetched_whatever_order_the_server_answers_in() -> anyhow::Result<
     );
 
     server.headers = vec![genesis, header_1, header_2b, header_3b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1233,7 +1233,7 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
                 continue;
             }
         }
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     let stale_req = match in_flight.as_slice() {
         [req] => req.clone(),
@@ -1244,7 +1244,7 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     // The reorg lands. It runs deeper than the reorg window, so the consistency pass rewrites
     // only the top of the chain and never learns that height 2 changed too.
     server.headers = chain_b.clone();
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1255,7 +1255,7 @@ fn header_fetched_before_a_reorg_is_not_spliced_into_the_chain() -> anyhow::Resu
     let mut updates = drain_requests(&mut state, &mut queue, &server);
 
     // The held answer describes the chain we have left behind.
-    updates.extend(state.poll(&mut queue, stale_resp)?);
+    updates.extend(state.handle_incoming(&mut queue, stale_resp)?);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     let tip = updates
@@ -1324,7 +1324,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
     let new_status =
         ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
             .expect("history must be non-empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1340,7 +1340,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
             in_flight.push(req);
             continue;
         }
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     let held_req = match in_flight.as_slice() {
         [req] => req.clone(),
@@ -1350,7 +1350,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
     // The reorg evicts height 2, where this script is recorded — so the refetch wants to replay
     // its job, and must decline because the server's own job is already there.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1359,7 +1359,7 @@ fn a_replayed_job_does_not_displace_one_the_server_started() -> anyhow::Result<(
         })),
     )?;
     let mut updates = drain_requests(&mut state, &mut queue, &server);
-    updates.extend(state.poll(&mut queue, response(&held_req, &server))?);
+    updates.extend(state.handle_incoming(&mut queue, response(&held_req, &server))?);
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
     assert!(
@@ -1436,7 +1436,7 @@ fn a_header_the_server_does_not_have_does_not_loop() -> anyhow::Result<()> {
             req.method,
             req.params
         );
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     Ok(())
 }
@@ -1484,7 +1484,7 @@ fn a_history_that_comes_back_empty_clears_the_subscription() -> anyhow::Result<(
         ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
             .expect("history must be non-empty");
     assert_ne!(new_status, old_status);
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1503,7 +1503,7 @@ fn a_history_that_comes_back_empty_clears_the_subscription() -> anyhow::Result<(
         } else {
             response(&req, &server)
         };
-        state.poll(&mut queue, resp)?;
+        state.handle_incoming(&mut queue, resp)?;
     }
     assert!(answered_empty, "the job must have asked for the history");
 
@@ -1556,7 +1556,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
 
     // The transaction is gone, so the script's status goes to null.
     server.txs = Vec::new();
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1572,7 +1572,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
 
     // A reorg evicting the height it used to be seen at must not replay anything.
     server.headers = vec![genesis, header_1, header_2b, header_3b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1583,7 +1583,7 @@ fn a_script_whose_history_goes_away_is_not_replayed() -> anyhow::Result<()> {
     let mut asked = Vec::new();
     while let Some(req) = queue.pop_front() {
         asked.push(req.method.to_string());
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     assert!(
         !asked
@@ -1656,7 +1656,7 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
     while let Some(req) = queue.pop_front() {
         served += 1;
         assert!(served < 200, "a mismatch must not become a request loop");
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     assert!(
         state.cache().tx_cache.anchors.is_empty(),
@@ -1669,7 +1669,7 @@ fn a_proof_for_another_block_is_not_a_verdict_on_ours() -> anyhow::Result<()> {
     server.merkle_proof = (Vec::new(), 0);
     let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
         .expect("history must be non-empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1756,7 +1756,7 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
         } else {
             response(&req, &server)
         };
-        state.poll(&mut queue, resp)?;
+        state.handle_incoming(&mut queue, resp)?;
     }
     assert!(
         state.cache().tx_cache.anchors.is_empty(),
@@ -1768,7 +1768,7 @@ fn a_merkle_error_below_the_reorg_window_is_recovered_by_a_script_notification(
     server.headers[2] = ours;
     let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
         .expect("history must be non-empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -1865,7 +1865,7 @@ fn a_tip_that_moves_while_headers_are_in_flight_is_not_lost() -> anyhow::Result<
     };
 
     // The A-chain tip. Hold its headers request so the job is still waiting.
-    state.poll(&mut queue, notify(&chain_a))?;
+    state.handle_incoming(&mut queue, notify(&chain_a))?;
     let held = queue
         .drain(..)
         .filter(|req| req.method.as_ref() == "blockchain.block.headers")
@@ -1878,7 +1878,7 @@ fn a_tip_that_moves_while_headers_are_in_flight_is_not_lost() -> anyhow::Result<
 
     // The server reorgs to B and notifies the new tip at the same height.
     server.headers = chain_b.clone();
-    state.poll(&mut queue, notify(&chain_b))?;
+    state.handle_incoming(&mut queue, notify(&chain_b))?;
     assert!(
         queue
             .iter()
@@ -1889,7 +1889,7 @@ fn a_tip_that_moves_while_headers_are_in_flight_is_not_lost() -> anyhow::Result<
     // The held answer describes the chain the server has left.
     let mut updates = Vec::new();
     for resp in held_resp {
-        updates.extend(state.poll(&mut queue, resp)?);
+        updates.extend(state.handle_incoming(&mut queue, resp)?);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
@@ -1932,7 +1932,7 @@ fn headers_for_a_chain_we_were_not_told_about_are_not_adopted() -> anyhow::Resul
     drain_requests(&mut state, &mut queue, &server);
 
     // A3 is announced, so that is the block the job is created to reach.
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2015,7 +2015,7 @@ fn a_reorg_reanchors_every_script_not_just_the_last_to_notify() -> anyhow::Resul
     let status_a =
         ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash_a.to_string())))
             .expect("history must be non-empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2027,7 +2027,7 @@ fn a_reorg_reanchors_every_script_not_just_the_last_to_notify() -> anyhow::Resul
 
     // The reorg lands. Only the tip announcement reports it; neither script will be notified.
     server.headers = vec![genesis, header_1, header_2b, header_3b, header_4b];
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2082,7 +2082,7 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
             height: absolute::Height::from_consensus(2)?,
         })])
         .expect("history is not empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2100,7 +2100,7 @@ fn a_history_that_cannot_match_the_job_is_not_re_asked() -> anyhow::Result<()> {
             req.method,
             req.params
         );
-        state.poll(&mut queue, response(&req, &server))?;
+        state.handle_incoming(&mut queue, response(&req, &server))?;
     }
     Ok(())
 }
@@ -2138,7 +2138,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
             height: absolute::Height::from_consensus(2)?,
         })])
         .expect("history is not empty");
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2146,7 +2146,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
             "params": [spk_hash.to_string(), status.to_string()],
         })),
     )?;
-    state.poll(
+    state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2162,7 +2162,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
     let mut deferred = Vec::<RawRequest>::new();
     while let Some(req) = queue.pop_front() {
         if req.method.as_ref() == "blockchain.scripthash.get_history" {
-            state.poll(&mut queue, response(&req, &server))?;
+            state.handle_incoming(&mut queue, response(&req, &server))?;
         } else {
             deferred.push(req);
         }
@@ -2185,7 +2185,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
     // transaction and its anchor.
     let mut updates = Vec::new();
     for req in deferred {
-        updates.extend(state.poll(&mut queue, response(&req, &server))?);
+        updates.extend(state.handle_incoming(&mut queue, response(&req, &server))?);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
     assert!(
@@ -2205,7 +2205,7 @@ fn confirmation_job_runs_ahead_of_the_scripts() -> anyhow::Result<()> {
     // A finished job must hand its update over once, not on every poll that reaches it. The
     // server re-announcing the tip it already announced drives `poll_confirmation_job` without
     // moving the target or the statuses, so nothing may come back out.
-    let again = state.poll(
+    let again = state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2260,7 +2260,7 @@ fn a_transaction_that_is_not_the_one_asked_for_is_rejected() -> anyhow::Result<(
         } else {
             response(&req, &server)
         };
-        result = state.poll(&mut queue, msg);
+        result = state.handle_incoming(&mut queue, msg);
         if result.is_err() {
             break;
         }
@@ -2333,7 +2333,7 @@ fn history_response_replaces_the_expected_txids() -> anyhow::Result<()> {
     // Everything the script had is now gone, so the server reports no history at all.
     server.txs.clear();
     let mut updates = Vec::new();
-    updates.extend(state.poll(
+    updates.extend(state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2378,7 +2378,7 @@ fn eviction_survives_its_job_being_replaced() -> anyhow::Result<()> {
         if req.method.as_ref() == "blockchain.transaction.get" {
             deferred.push(req);
         } else {
-            updates.extend(state.poll(&mut queue, response(&req, &server))?);
+            updates.extend(state.handle_incoming(&mut queue, response(&req, &server))?);
         }
     }
     assert!(
@@ -2389,7 +2389,7 @@ fn eviction_survives_its_job_being_replaced() -> anyhow::Result<()> {
     // The server announces the same status again, which replaces the job.
     let status = ElectrumScriptStatus::from_history(&server.history(&json!(spk_hash.to_string())))
         .expect("history is not empty");
-    updates.extend(state.poll(
+    updates.extend(state.handle_incoming(
         &mut queue,
         raw_msg(json!({
             "jsonrpc": "2.0",
@@ -2398,7 +2398,7 @@ fn eviction_survives_its_job_being_replaced() -> anyhow::Result<()> {
         })),
     )?);
     for req in deferred {
-        updates.extend(state.poll(&mut queue, response(&req, &server))?);
+        updates.extend(state.handle_incoming(&mut queue, response(&req, &server))?);
     }
     updates.extend(drain_requests(&mut state, &mut queue, &server));
 
