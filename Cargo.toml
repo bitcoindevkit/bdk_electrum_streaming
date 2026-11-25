@@ -5,7 +5,7 @@ description = "An async/blocking Electrum client for BDK, built as an explicit s
 license = "MIT OR Apache-2.0"
 edition = "2021"
 rust-version = "1.70"
-repository = "https://github.com/evanlinjin/experiments"
+repository = "https://github.com/bitcoindevkit/bdk_electrum_streaming"
 documentation = "https://docs.rs/bdk_electrum_streaming"
 readme = "README.md"
 
