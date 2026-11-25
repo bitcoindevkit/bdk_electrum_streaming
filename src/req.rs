@@ -1,0 +1,205 @@
+use std::collections::{hash_map, BTreeSet, HashMap, VecDeque};
+
+use electrum_streaming_client::{request, RawRequest, Request};
+
+use crate::JobId;
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum JobRequest {
+    GetHeaders(request::Headers),
+    GetHistory(request::GetHistory),
+    GetTx(request::GetTx),
+    GetTxMerkle(request::GetTxMerkle),
+    ScriptHashSubscribe(request::ScriptHashSubscribe),
+    HeadersSubscribe(request::HeadersSubscribe),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum UserRequest {
+    Ping(request::Ping),
+    BroadcastTx(request::BroadcastTx),
+    GetFeeHistogram(request::GetFeeHistogram),
+}
+
+impl JobRequest {
+    pub fn into_raw(self, req_id: u32) -> RawRequest {
+        let (method, params) = match self {
+            JobRequest::GetHeaders(headers) => headers.to_method_and_params(),
+            JobRequest::GetHistory(get_history) => get_history.to_method_and_params(),
+            JobRequest::GetTx(get_tx) => get_tx.to_method_and_params(),
+            JobRequest::GetTxMerkle(get_tx_merkle) => get_tx_merkle.to_method_and_params(),
+            JobRequest::ScriptHashSubscribe(script_hash_subscribe) => {
+                script_hash_subscribe.to_method_and_params()
+            }
+            JobRequest::HeadersSubscribe(headers_subscribe) => {
+                headers_subscribe.to_method_and_params()
+            }
+        };
+        RawRequest::new(req_id, method, params)
+    }
+
+    pub fn to_raw(&self, req_id: u32) -> RawRequest {
+        self.clone().into_raw(req_id)
+    }
+}
+
+impl From<request::Headers> for JobRequest {
+    fn from(value: request::Headers) -> Self {
+        Self::GetHeaders(value)
+    }
+}
+
+impl From<request::GetHistory> for JobRequest {
+    fn from(value: request::GetHistory) -> Self {
+        Self::GetHistory(value)
+    }
+}
+
+impl From<request::GetTx> for JobRequest {
+    fn from(value: request::GetTx) -> Self {
+        Self::GetTx(value)
+    }
+}
+
+impl From<request::GetTxMerkle> for JobRequest {
+    fn from(value: request::GetTxMerkle) -> Self {
+        Self::GetTxMerkle(value)
+    }
+}
+
+impl From<request::ScriptHashSubscribe> for JobRequest {
+    fn from(value: request::ScriptHashSubscribe) -> Self {
+        Self::ScriptHashSubscribe(value)
+    }
+}
+
+impl From<request::HeadersSubscribe> for JobRequest {
+    fn from(value: request::HeadersSubscribe) -> Self {
+        Self::HeadersSubscribe(value)
+    }
+}
+
+/// A response's originating request, alongside what is needed to route it.
+#[derive(Debug, Clone)]
+pub struct PoppedRequest {
+    /// The request this response is answering.
+    pub request: JobRequest,
+    /// Jobs awaiting this response.
+    pub job_ids: BTreeSet<JobId>,
+    /// Whether the local chain dropped blocks after this request was sent.
+    ///
+    /// The server answers from its own chain, so a response which predates a reorg may describe
+    /// a block which is no longer the one we have at that height.
+    pub reorged_since_sent: bool,
+}
+
+/// Request coordinator.
+///
+/// Associates responses to their requests and requests to their jobs.
+#[derive(Debug, Clone, Default)]
+pub struct ReqCoord {
+    next_id: u32,
+    /// Req id -> the request, and the chain generation it was enqueued at.
+    awaiting_responses: HashMap<u32, (JobRequest, u64)>,
+    /// Also what an identical request is deduplicated against.
+    req_to_job: HashMap<JobRequest, BTreeSet<JobId>>,
+    /// Bumped every time the local chain drops blocks.
+    chain_generation: u64,
+}
+
+impl ReqCoord {
+    pub fn new(next_id: u32) -> Self {
+        Self {
+            next_id,
+            ..Default::default()
+        }
+    }
+
+    pub fn next_id_mut(&mut self) -> &mut u32 {
+        &mut self.next_id
+    }
+
+    pub fn pop(&mut self, req_id: u32) -> Option<PoppedRequest> {
+        let (request, generation) = self.awaiting_responses.remove(&req_id)?;
+        let job_ids = self.req_to_job.remove(&request).unwrap_or_default();
+        Some(PoppedRequest {
+            request,
+            job_ids,
+            reorged_since_sent: generation < self.chain_generation,
+        })
+    }
+
+    /// Forget every request `job_id` is still waiting on.
+    ///
+    /// A request wanted by another job stays in flight and merely loses `job_id` as an owner.
+    /// One that nothing else wants is dropped outright, so its response is ignored on arrival
+    /// and an identical request is no longer deduplicated against it.
+    pub fn forget_job(&mut self, job_id: JobId) {
+        let mut orphaned = Vec::new();
+        self.req_to_job.retain(|req, job_ids| {
+            if !job_ids.remove(&job_id) || !job_ids.is_empty() {
+                return true;
+            }
+            orphaned.push(req.clone());
+            false
+        });
+        self.awaiting_responses
+            .retain(|_, (req, _)| !orphaned.contains(req));
+    }
+
+    /// To be called when the local chain drops blocks.
+    ///
+    /// Requests already in flight were made against the old chain, so their responses can no
+    /// longer be trusted to describe the blocks we now have.
+    pub fn bump_chain_generation(&mut self) {
+        self.chain_generation += 1;
+    }
+
+    pub fn queuer<'q>(&'q mut self, queue: &'q mut ReqQueue, job_id: JobId) -> ReqQueuer<'q> {
+        let coord = self;
+        ReqQueuer {
+            coord,
+            queue,
+            job_id,
+        }
+    }
+
+    pub fn pending_requests(&self) -> impl ExactSizeIterator<Item = RawRequest> + '_ {
+        self.awaiting_responses
+            .iter()
+            .map(|(&req_id, (req, _))| req.to_raw(req_id))
+    }
+}
+
+/// Queue of raw requests.
+pub type ReqQueue = VecDeque<RawRequest>;
+
+/// Queues requests to broadcast so that once the response is received, we can determine it's
+/// response type and associated jobs.
+#[derive(Debug)]
+pub struct ReqQueuer<'q> {
+    coord: &'q mut ReqCoord,
+    queue: &'q mut ReqQueue,
+    job_id: JobId,
+}
+
+impl<'q> ReqQueuer<'q> {
+    pub fn enqueue<R: Into<JobRequest>>(&mut self, req: R) {
+        let req: JobRequest = req.into();
+        match self.coord.req_to_job.entry(req.clone()) {
+            hash_map::Entry::Occupied(mut e) => {
+                e.get_mut().insert(self.job_id);
+            }
+            hash_map::Entry::Vacant(e) => {
+                e.insert(BTreeSet::new()).insert(self.job_id);
+                let req_id = self.coord.next_id;
+                self.coord.next_id = self.coord.next_id.wrapping_add(1);
+                let generation = self.coord.chain_generation;
+                self.coord
+                    .awaiting_responses
+                    .insert(req_id, (req.clone(), generation));
+                self.queue.push_back(req.into_raw(req_id));
+            }
+        }
+    }
+}
